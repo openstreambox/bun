@@ -5,6 +5,8 @@ const { basename } = require("node:path");
 // The native `node:fs` binding, shared via `internal/fs/binding`.
 const fs = require("internal/fs/binding");
 
+const assertEncoding = $bindgen("node_util_binding.bind.ts", "assertEncodingValid") as (encoding: unknown) => void;
+
 // Creates an ignore matcher function from the `ignore` watch option,
 // mirroring node lib/internal/fs/watchers.js createIgnoreMatcher.
 // string -> glob (patterns without a slash also match the basename),
@@ -142,17 +144,19 @@ class FSWatcher extends EventEmitter {
   constructor(path, options, listener) {
     super();
 
-    if (typeof path !== "string") {
-      path = require("internal/url").toPathIfFileURL(path);
-    } else if (path.startsWith("file:")) {
-      path = Bun.fileURLToPath(path);
-    }
-
     if (typeof options === "function") {
       listener = options;
       options = {};
     } else if (typeof options === "string") {
       options = { encoding: options };
+    }
+    // node's getOptions() runs first, so an invalid encoding wins over everything else.
+    assertEncoding(options?.encoding);
+
+    if (typeof path !== "string") {
+      path = require("internal/url").toPathIfFileURL(path);
+    } else if (path.startsWith("file:")) {
+      path = Bun.fileURLToPath(path);
     }
 
     if (typeof listener !== "function") {
