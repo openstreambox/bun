@@ -323,6 +323,37 @@ describe("node:test", () => {
       stderr: expect.stringContaining("0 fail"),
     });
   });
+
+  test.concurrent(
+    "should give every --retry attempt of a test its own state",
+    async () => {
+      const { lines, counts, exitCode } = observed(await runTests(["32-retry.js"], {}, ["--retry", "1"]));
+      expect(lines).toEqual([
+        "subtests: attempt 1 child runs=1",
+        "subtests: attempt 2 child runs=2",
+        "t.after(): hook of attempt 1 runs=1",
+        "t.after(): hook of attempt 2 runs=2",
+      ]);
+      // Four tests pass on their second attempt or are expected to fail. Two fail on both attempts.
+      expect({ counts, exitCode }).toEqual({ counts: ["4 pass", "1 skip", "2 fail"], exitCode: 1 });
+    },
+    30_000,
+  );
+
+  test.concurrent(
+    "should release a --retry attempt that bun:test's own timeout replaced, and ignore its late failure",
+    async () => {
+      const args = ["--retry", "1", "--timeout", "1"];
+      const { lines, counts, exitCode } = observed(await runTests(["33-retry-abandoned-attempt.js"], {}, args));
+      expect(lines).toEqual([
+        "t.after of the first attempt",
+        "second attempt: method=real setTimeout is real=true",
+        "runs once: attempts of the other test=2 runs of this test=1",
+      ]);
+      expect({ counts, exitCode }).toEqual({ counts: ["1 pass", "1 fail"], exitCode: 1 });
+    },
+    30_000,
+  );
 });
 
 async function runTests(filenames: string[], env: Record<string, string> = {}, args: string[] = []) {
@@ -342,6 +373,22 @@ async function runTests(filenames: string[], env: Record<string, string> = {}, a
     new Response(stderrStream).text(),
   ]);
   return { exitCode, stdout, stderr };
+}
+
+// The lines a fixture logged with its "OBS " prefix, and the counts that `bun test` printed at the end.
+function observed({ exitCode, stdout, stderr }: Awaited<ReturnType<typeof runTests>>) {
+  const lines = linesOf(stdout)
+    .filter(line => line.startsWith("OBS "))
+    .map(line => line.slice(4));
+  const counts = linesOf(stderr).filter(line => /^\d+ (pass|fail|skip|todo|errors?)$/.test(line));
+  return { lines, counts, exitCode };
+}
+
+function linesOf(text: string) {
+  return text
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => line !== "");
 }
 
 describe("node:test mock", () => {

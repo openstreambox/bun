@@ -1647,6 +1647,28 @@ class TestNode {
     return this.#suiteCtx;
   }
 
+  // bun:test calls a registration again for each --retry attempt, and a run keeps its state on its node.
+  nextAttempt(): TestNode {
+    const next = new TestNode(this.name, this.parent, this.options, false, false);
+    next.ownTags = this.ownTags;
+    next.filePath = this.filePath;
+    return next;
+  }
+
+  // What an attempt that bun:test replaced still holds: its mocks, and its `t.after` hooks if its body never ended.
+  release(): Promise<void> | undefined {
+    try {
+      this.mockTracker?.reset();
+    } catch {
+      // Nothing can take this error: bun:test already ended the attempt.
+    }
+    if (this.finished) return;
+    const hooks = this.hooks.after;
+    if (hooks.length === 0) return;
+    this.hooks.after = [];
+    return runReleasedHooks(this, hooks);
+  }
+
   // True while user code reached from this node should treat new tests as
   // inline subtests instead of bun:test registrations.
   isRunning(): boolean {
@@ -1967,7 +1989,13 @@ function parseTestArgs(arg0: unknown, arg1: unknown, arg2: unknown) {
     options = kDefaultOptions;
   }
 
-  return { name, options, fn };
+  return { name, options: options === kDefaultOptions ? options : declaredOptions(options), fn };
+}
+
+// Node reads every option once, at the declaration (test.js:572). A --retry attempt is built from it again.
+function declaredOptions(options: TestOptions): TestOptions {
+  const { concurrency, expectFailure, only, plan, signal, skip, tags, timeout, todo } = options;
+  return { concurrency, expectFailure, only, plan, signal, skip, tags, timeout, todo };
 }
 
 // Shared by test and hook options: Node validates both the same way.
@@ -2286,6 +2314,17 @@ async function runOwnBeforeHooks(node: TestNode) {
   }
 }
 
+async function runReleasedHooks(node: TestNode, hooks: Hook[]) {
+  const ctx = node.getCtx();
+  for (const hook of hooks) {
+    try {
+      await runHook(hook, node, ctx);
+    } catch {
+      // Nothing can take this error either.
+    }
+  }
+}
+
 async function executeTestNode(node: TestNode, fn: TestFn): Promise<unknown> {
   // Runs a single test (top-level or subtest): inherited beforeEach hooks, the
   // body, pending subtests, the plan check, inherited afterEach hooks, and the
@@ -2558,16 +2597,26 @@ function currentCollectionParent(): TestNode {
   return getRootNode();
 }
 
-function createTopLevelTestRunner(node: TestNode, fn: TestFn, declaredTodo = false) {
+// `todoSpelling`: the test.todo() spelling under a run() child, which has no other trace on a new node.
+function createTopLevelTestRunner(current: TestNode, fn: TestFn, declaredTodo = false, todoSpelling = false) {
   // bun:test invokes this with a `done` callback because the function declares
   // one parameter.
   return (done: (error?: unknown) => void) => {
+    const previous = current.started ? current : undefined;
+    if (previous !== undefined) current = previous.nextAttempt();
+    const node = current;
+    if (todoSpelling) node.todoFlag = true;
     // Under plain bun:test a describe.todo scope already handles its children's
     // todo verdict (FailBecauseTodoPassed under --todo), so don't override when
     // the flag was only inherited; under a run() child the suite registers as a
     // plain describe so bun:test has no todo scope to consult.
     const todoBefore = node.todoFlag;
-    executeTestNode(node, fn).then(
+    const released = previous?.release();
+    // This runner takes a new node when `started` is set, and bun:test can call it again before these hooks end.
+    if (released !== undefined) node.started = true;
+    const run = released === undefined ? executeTestNode(node, fn) : released.then(() => executeTestNode(node, fn));
+    // A failure rejects: bun:test drops the rejection of a test it timed out, a late done(error) fails another test.
+    return run.then(
       failure => {
         // A runtime t.skip()/t.todo() overrides bun:test's pass/fail accounting
         // (Node counts these as skip/todo even when the body threw); a declared
@@ -2576,13 +2625,16 @@ function createTopLevelTestRunner(node: TestNode, fn: TestFn, declaredTodo = fal
           markCurrentResult(false, done);
         } else if (node.todoFlag && !declaredTodo && (runChildReporterEnabled || !todoBefore)) {
           markCurrentResult(true, done);
-        } else {
-          done(failure);
-          return;
+        } else if (failure !== undefined) {
+          done(undefined);
+          throw failure;
         }
         done(undefined);
       },
-      err => done(err),
+      err => {
+        done(undefined);
+        throw err;
+      },
     );
   };
 }
@@ -2652,9 +2704,8 @@ function addTest(
     // end (what createTopLevelTestRunner already does for a runtime t.todo()).
     if (runChildReporterEnabled && effectiveMode === "todo") {
       // The test.todo() spelling carries the directive in `mode`, not in the
-      // options, so the node has to be marked for the runner to report it.
-      node.todoFlag = true;
-      const runner = createTopLevelTestRunner(node, fn);
+      // options, so the runner has to mark the node to report it.
+      const runner = createTopLevelTestRunner(node, fn, false, true);
       if (passOptions !== undefined) test(name, runner, passOptions);
       else test(name, runner);
       return Promise.resolve(undefined);
