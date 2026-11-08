@@ -1864,6 +1864,13 @@ impl VirtualMachine {
             || self.has_immediates()
     }
 
+    /// What an unref'd `setImmediate` asks, because it does not keep the loop alive by itself: does something other than an immediate keep it alive. An unhandled error does not end the loop of `bun test`.
+    #[inline]
+    pub fn is_event_loop_kept_alive(&self) -> bool {
+        (self.unhandled_error_counter == 0 || isBunTest.load(core::sync::atomic::Ordering::Relaxed))
+            && (self.is_platform_loop_active() || self.has_queued_work_excluding_immediates())
+    }
+
     /// Unlike `is_event_loop_alive`, also counts unref'd handles and timers, since they can still run JS.
     pub fn has_work_left(&self) -> bool {
         // Must be read before the queues: the waiter thread posts a child's exit, then stops counting the child.

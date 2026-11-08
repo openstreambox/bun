@@ -1,6 +1,6 @@
 import jsc from "bun:jsc";
 import { describe, expect, it, mock, test } from "bun:test";
-import { bunEnv, bunExe, bunRun, isWindows } from "harness";
+import { bunEnv, bunExe, bunRun, isWindows, tempDir } from "harness";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { clearInterval, clearTimeout, promises, setImmediate, setInterval, setTimeout } from "node:timers";
@@ -498,3 +498,52 @@ it("timers/promises clears its timers with the globals that were there when it s
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   expect({ stdout, stderr, exitCode }).toEqual({ stdout: "1,0,1,0,1,0\n", stderr: "", exitCode: 0 });
 });
+
+// `bun test` runs on after an error that nothing handles. The timers of the tests and files behind that error follow
+// the rules that they had before it.
+describe.each(["the same file", "a later file"])(
+  "setImmediate().unref() in bun test, after an unhandled error in %s",
+  where => {
+    it("runs while a timer holds the event loop", async () => {
+      const header = `import { expect, test } from "bun:test";`;
+      const throws = `
+        test("throws where nothing handles it", async () => {
+          const { promise, resolve } = Promise.withResolvers();
+          setTimeout(() => {
+            resolve();
+            throw new Error("unhandled on purpose");
+          }, 1);
+          await promise;
+        });
+      `;
+      // The timer holds the loop. Its immediate is queued behind the unref'd one, which has run or was dropped by then.
+      const unrefd = `
+        test("an unref'd immediate runs", async () => {
+          let ran = false;
+          setImmediate(() => {
+            ran = true;
+          }).unref();
+          await new Promise(resolve => setTimeout(() => setImmediate(resolve), 1));
+          expect(ran).toBe(true);
+        });
+      `;
+      const files: Record<string, string> =
+        where === "the same file"
+          ? { "a.test.js": header + throws + unrefd }
+          : { "a.test.js": header + throws, "b.test.js": header + unrefd };
+      using dir = tempDir("unrefd-immediate-after-error", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...Object.keys(files)],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      const output = stdout + stderr;
+      expect(output).toContain("unhandled on purpose");
+      expect(output).toContain("(pass) an unref'd immediate runs");
+      expect(exitCode).toBe(1);
+    });
+  },
+);
