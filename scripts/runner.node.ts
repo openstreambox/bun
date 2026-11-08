@@ -367,6 +367,7 @@ const aotTestsThatAskTheSystem = [
   "aot/the-folder-of-a-program-has-a-short-name",
   "aot/diagnostics-end-in-lf",
   "aot/absolute-path-missing-at-build",
+  "aot/a-test-run-has-no-file-for-what-its-build-read-from-memory",
   // Native code: addons, sockets, the engine's own tests.
   "aot/native-addons",
   "aot/napi-addon",

@@ -837,12 +837,19 @@ pub(super) fn pair_entry_points<'b>(
     if entry_points.len() != module_ids.len() {
         return Err(corrupted_program());
     }
+    // `run_compiled::set_stand_in`: the build read it from memory, and no file is there.
+    let stand_ins = match runs_in_place {
+        true => crate::cli::run_compiled::files_in_memory(),
+        false => None,
+    };
+    let is_stand_in = |path: &[u8]| stand_ins.is_some_and(|held| held.contains(path));
     let pairs = entry_points.iter().zip(module_ids);
     Ok(pairs
         .map(|(entry_point, &module_id)| CompiledEntryPointInput {
             module_id,
             // An executable that is shipped tells nobody the folders of the machine that built it.
             source_path: match runs_in_place {
+                true if is_stand_in(&entry_point.source_path) => b"",
                 true => &entry_point.source_path,
                 false => &entry_point.module_path,
             },

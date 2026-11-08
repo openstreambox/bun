@@ -705,7 +705,7 @@ pub(crate) fn add_source_directories(
 ) {
     if program.preserves_source_paths {
         for key in files.keys() {
-            if !is_bun_standalone_file_path(key) {
+            if !is_bun_standalone_file_path(key) && !program.is_module_without_file(key) {
                 add_ancestor_directories(dirs, key);
             }
         }
@@ -899,13 +899,11 @@ impl StandaloneModuleGraph {
         let source_paths = program
             .entry_points
             .iter()
+            .filter(|entry_point| !entry_point.has_no_file())
             .map(|entry_point| entry_point.source_path);
-        let files = self
-            .files
-            .keys()
-            .iter()
-            .map(|key| &key[..])
-            .filter(|key| !is_bun_standalone_file_path(key));
+        let files = self.files.keys().iter().map(|key| &key[..]).filter(|key| {
+            !is_bun_standalone_file_path(key) && !program.is_module_without_file(key)
+        });
         source_paths
             .chain(files)
             .reduce(|common, path| {
@@ -1912,6 +1910,43 @@ pub(crate) mod tests {
             assert!(stat("none").is_none());
             bun_sys::mkdir_recursive(&folder.join("plugins")).unwrap();
         }
+    }
+
+    // The build of a test run reads an entry point from memory. No disk ever held it: it is no file, the folders of its name are no folders, and it says nothing of where the sources lay.
+    #[test]
+    fn an_entry_point_without_a_file_makes_no_folder() {
+        let folder = TemporaryFolder::create("from-memory");
+        let names = ["main.js", "node_modules/.cache/stand-in.ts"];
+        let [main, stand_in] = names.map(|name| folder.join(name));
+        let output_files = [
+            entry_point_file(&main, Some(0)),
+            entry_point_file(&stand_in, Some(1)),
+        ];
+        let without_file = EntryPoint {
+            module_id: EngineModuleId(2),
+            source_path: b"",
+            module_path: &stand_in,
+        };
+        let entry_points = [entry_point(1, &main), without_file];
+        let graph = read_graph(&GraphRequest {
+            target: &CompileTarget::default(),
+            output_files: &output_files,
+            module_prefix: b"",
+            output_format: Format::Esm,
+            exec_argv: b"",
+            flags: Flags::default(),
+            runtime_options: RuntimeOptions::default(),
+            compiled_program: Some(program(&IMAGE, ALIGNMENT, &entry_points, true)),
+        });
+        let kind = |relative: &str| graph.source_path_kind(&folder.join(relative));
+        assert_eq!(kind("main.js"), Some(SourcePathKind::File));
+        for absent in [names[1], "node_modules/.cache", "node_modules"] {
+            assert_eq!(kind(absent), None, "{absent}");
+            assert!(!graph.owns_directory(&folder.join(absent)), "{absent}");
+        }
+        assert!(graph.may_answer_for(&main));
+        // On Windows the graph is asked about every path.
+        assert!(cfg!(windows) || !graph.may_answer_for(b"/no-such-root/main.js"));
     }
 
     #[cfg(not(windows))]

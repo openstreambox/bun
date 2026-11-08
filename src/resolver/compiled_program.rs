@@ -20,9 +20,16 @@ pub struct ImageFile {
 pub struct CompiledEntryPoint {
     pub file_index: u32,
     pub module_id: u32,
+    /// Empty: the build read the entry point from memory, and no disk ever held a file of its name.
     pub source_path: &'static [u8],
     /// The key of the compiled module, which frames, `import.meta.path` and `Bun.main` show.
     pub module_path: &'static [u8],
+}
+
+impl CompiledEntryPoint {
+    pub fn has_no_file(&self) -> bool {
+        self.source_path.is_empty()
+    }
 }
 
 /// A name that leads to an entry point and is not the path of its file: the name of a package, a key of its `exports`, a folder whose `package.json` names its main file, or what the program writes where it starts a Worker.
@@ -79,6 +86,8 @@ pub struct CompiledProgram {
     pub preserves_source_paths: bool,
     /// Indices into `entry_points`, ascending by `compare_source_paths`.
     source_path_order: Box<[u32]>,
+    /// `CompiledEntryPoint::module_path` of each entry point that has no file.
+    modules_without_files: Box<[&'static [u8]]>,
     /// Ascending by `path`.
     package_names: Box<[CompiledPackageName]>,
     /// Those of one folder are in the order of its tsconfig.json.
@@ -462,12 +471,15 @@ impl CompiledProgram {
                 .iter()
                 .all(|&index| (index as usize) < entry_points.len())
         );
+        let without_files = entry_points.iter().filter(|entry| entry.has_no_file());
+        let modules_without_files = without_files.map(|entry| entry.module_path).collect();
         CompiledProgram {
             image,
             backing_file,
             entry_points,
             preserves_source_paths,
             source_path_order,
+            modules_without_files,
             package_names: Box::new([]),
             path_aliases: Box::new([]),
             root_below_working_directory: None,
@@ -727,6 +739,10 @@ impl CompiledProgram {
         listing(&start, &mut |path| {
             // A file that only an attribute asks for stands under its path, a question mark and the name of the form.
             let path = bun_core::strings::split(path, b"?").next().unwrap_or(path);
+            // The list stands for files that the disk may have lost.
+            if self.is_module_without_file(path) {
+                return true;
+            }
             if cfg!(windows) {
                 let mut path = path.to_vec();
                 to_separators::<b'\\', b'/'>(&mut path);
@@ -734,6 +750,12 @@ impl CompiledProgram {
             }
             each(path)
         });
+    }
+
+    /// Whether `path` is the module of an entry point that has no file: no disk ever held it, so it is no file and makes no folder.
+    pub fn is_module_without_file(&self, path: &[u8]) -> bool {
+        let mut without_files = self.modules_without_files.iter();
+        without_files.any(|module| compare_source_paths(module, path).is_eq())
     }
 
     /// Whether the image may hold a module at `path` or below it. `path` is followed by a `/` that is not part of it. Nothing is listed, and where the folder of `path` holds no code nothing is looked up.
@@ -1325,6 +1347,59 @@ mod tests {
         for directory in [&b"/a/b.ts"[..], b"/a/", b"/aa", b"/b", b"/"] {
             assert!(in_directory(directory).is_empty());
         }
+    }
+
+    // Ascending, as an image lists the files that it holds compiled.
+    const COMPILED_FILES: [&[u8]; 3] = [
+        b"/project/lost.js",
+        b"/project/main.js",
+        b"/project/node_modules/.cache/stand-in.ts",
+    ];
+
+    fn list_compiled_files(start: &[u8], each: &mut dyn FnMut(&[u8]) -> bool) {
+        let mut files = COMPILED_FILES.iter().filter(|file| file.starts_with(start));
+        while files.next().is_some_and(|file| each(file)) {}
+    }
+
+    // The build of a test run reads an entry point from memory. No disk ever held it, so the program names no file and no folder for it.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_entry_point_without_a_file_is_no_file_in_any_folder() {
+        let [lost, main, stand_in] = COMPILED_FILES;
+        let entry_points = [(main, main), (&b""[..], stand_in)];
+        let entry_points = (0..).zip(entry_points).map(|(file_index, entry_point)| {
+            let (source_path, module_path) = entry_point;
+            CompiledEntryPoint {
+                file_index,
+                module_id: file_index,
+                source_path,
+                module_path,
+            }
+        });
+        let order = Box::new([1u32, 0]);
+        let program = CompiledProgram::new(b"image", None, entry_points.collect(), order, true);
+        program.set_module_listing(list_compiled_files);
+        assert!(program.is_module_without_file(stand_in));
+        assert!(!program.is_module_without_file(main) && !program.is_module_without_file(lost));
+
+        assert!(program.holds_module_at(main) && program.holds_module_at(lost));
+        assert!(!program.holds_module_at(stand_in));
+        assert!(program.holds_module_below(b"/project"));
+        for folder in [
+            &b"/project/node_modules"[..],
+            b"/project/node_modules/.cache",
+        ] {
+            assert!(!program.holds_module_below(folder));
+            assert!(source_paths_in(&program, folder).is_empty());
+        }
+        let mut listed: Vec<Vec<u8>> = Vec::new();
+        program.for_each_module_below(b"/project", &mut |path| {
+            listed.push(path.to_vec());
+            true
+        });
+        assert_eq!(listed, [lost, main]);
+        assert_eq!(source_paths_in(&program, b"/project"), [main]);
+        assert!(program.entry_point_by_source_path(stand_in).is_none());
     }
 
     #[test]
