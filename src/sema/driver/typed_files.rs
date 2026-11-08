@@ -3404,6 +3404,16 @@ impl<'a> Transfer<'_, 'a, '_> {
                 .take_while(move |entry| (entry.0, entry.1) < end)
                 .map(|entry| entry.2)
         };
+        let holds = |found: ExprId, source: u32, expr: &Expr| {
+            if found.is_none() {
+                return false;
+            }
+            let (start, end) = output.outer_span(found);
+            // The printer maps a token, then may put a space before it.
+            let is_after_a_space = start > 0 && output.byte(start - 1) == b' ';
+            let start = start - u32::from(is_after_a_space);
+            printed(source, expr).any(|at| start <= at && at < end)
+        };
         for (index, module) in written.iter().enumerate() {
             let Some(module) = module.as_ref().filter(|module| !module.is_unchecked()) else {
                 continue;
@@ -3436,14 +3446,24 @@ impl<'a> Transfer<'_, 'a, '_> {
             };
             let find_below = |mut found: ExprId, way: Vec<(ExprId, usize)>| {
                 for (parent, place) in way.into_iter().rev() {
-                    let children = output.children(found);
+                    let (children, source_children) =
+                        (output.children(found), syntax.children(parent));
                     if std::mem::discriminant(&syntax.file[parent].kind)
                         != std::mem::discriminant(&output_file[found].kind)
-                        || children.len() != syntax.children(parent).len()
+                        || children.len() != source_children.len()
                     {
                         return None;
                     }
-                    found = children[place];
+                    // The build can print the children in another order: `null == a` as `a == null`.
+                    let child = &syntax.file[source_children[place]];
+                    let is_child = |&candidate: &ExprId| holds(candidate, index as u32, child);
+                    found = match is_child(&children[place]) {
+                        true => children[place],
+                        false => {
+                            let other = children.iter().copied().find(is_child);
+                            other.unwrap_or(children[place])
+                        }
+                    };
                 }
                 Some(found)
             };
@@ -3483,14 +3503,8 @@ impl<'a> Transfer<'_, 'a, '_> {
                 }
                 let &(owner, key) = owned.get(&at)?;
                 let found = find_below(*output_owned().get(&(owner, index as u32, key))?, way)?;
-                // The build turns comparisons around and writes defaults of its own.
-                let (start, end) = output.outer_span(found);
-                // The printer maps a token, then may put a space before it.
-                let is_after_a_space = start > 0 && output.byte(start - 1) == b' ';
-                let start = start - u32::from(is_after_a_space);
-                printed(index as u32, &syntax.file[chain.operand])
-                    .any(|at| start <= at && at < end)
-                    .then_some(found)
+                // The build writes defaults of its own, which are no operand of a source.
+                holds(found, index as u32, &syntax.file[chain.operand]).then_some(found)
             };
             let file = syntax.file;
             let variables = file
