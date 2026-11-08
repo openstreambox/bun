@@ -5671,6 +5671,21 @@ JSC::JSObject* objectHoldingExportOfModuleMock(JSC::JSGlobalObject* globalObject
     return mock ? mock->exports.get() : nullptr;
 }
 
+bool isExportUninitialized(JSC::JSGlobalObject* globalObject, JSC::JSModuleNamespaceObject* moduleNamespace, const JSC::Identifier& name)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    Zig::ExportVariable variable = Zig::findExportVariable(globalObject, moduleNamespace, name);
+    RETURN_IF_EXCEPTION(scope, false);
+    // Only a source text module has variables with a dead zone. That of `export * as`, of a lazy export of a builtin and of a mock is empty for another reason.
+    if (!variable.record || variable.localName == vm.propertyNames->starNamespacePrivateName || !variable.record->inherits<JSC::JSModuleRecord>())
+        return false;
+    if (variable.record->moduleEnvironment()->readVariable(vm, variable.offset))
+        return false;
+    // `import defer` has a namespace object of its own, which evaluates the module before it reads.
+    RELEASE_AND_RETURN(scope, moduleNamespace->moduleRecord()->getModuleNamespace(globalObject) == moduleNamespace);
+}
+
 #if ENABLE(AOT)
 JSC::JSObject* objectHoldingExportOfCompiledModuleMock(JSC::JSGlobalObject* globalObject, JSC::JSObject* moduleNamespace, const JSC::Identifier& name)
 {

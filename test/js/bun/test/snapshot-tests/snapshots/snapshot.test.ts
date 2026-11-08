@@ -1317,7 +1317,7 @@ const headers = {
 // Vitest 5.0.3 wrote formats/vitest and Jest 30.5.2 wrote formats/jest, both the .snap files and the inline snapshots.
 // To add a case, run it under that runner. Never update these with Bun.
 describe.concurrent("the fixtures and snapshot files that another runner wrote", () => {
-  const tests = { vitest: 971, jest: 601 };
+  const tests = { vitest: 980, jest: 604 };
 
   function copyOf(runner: "vitest" | "jest") {
     const dir = tempDir(`snapshot-formats-${runner}`, {});
@@ -2944,6 +2944,316 @@ describe.concurrent("what script hands to the printer of snapshots", () => {
       expect({ log, stderr: exitCode ? stderr : "", exitCode }).toEqual({ log: [], stderr: "", exitCode: 0 });
     },
   );
+});
+
+// A module namespace throws when an export is read whose `const` or `let` has not run. Before #44833 no snapshot of one threw.
+// What a test imports in Vitest, and in Jest with @babel/preset-env, is no such namespace and reads undefined there, which is
+// what formats/vitest/namespace.fixture.ts and formats/jest/namespace.fixture.js hold. Bun prints undefined for the export too.
+describe.concurrent("a module namespace with an export that is not set yet, in the formats of Vitest and Jest", () => {
+  async function logOf(files: Record<string, string>, env: Record<string, string> = {}) {
+    using dir = tempDir("snapshot-unset-export", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test"],
+      env: { ...bunEnv, CI: "true", ...env },
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { log: stdout.split("\n").filter(line => line && !line.startsWith("bun test ")), stderr, exitCode };
+  }
+  const read = (dir: unknown, ...path: string[]) => readFileSync(join(String(dir), ...path), "utf8");
+  const firstLine = `const firstLine = f => { try { f(); return "passes"; } catch (error) { return String(error).split("\\n")[0]; } };`;
+  // Its body throws halfway, so `later` is never set.
+  const stops = `
+    import * as self from "./stops.mjs";
+    export function hoisted() {}
+    (() => {
+      throw Object.assign(new Error("stops here"), { namespace: self });
+    })();
+    export const later = 1;
+  `;
+  const load = `const namespace = await import("./stops.mjs").catch(error => error.namespace);`;
+  const printed = `{\n  "namespace": {\n    "hoisted": [Function],\n    "later": undefined,\n  },\n}`;
+  const byOlderBun = `{\n  "namespace": Module {},\n}`;
+  const entry = (key: string, value: string) => `\nexports[\`${key}\`] = \`\n${value}\n\`;\n`;
+  const inVitest = (inline: string) => `
+    import { test, expect } from "vitest";
+    ${load}
+    test("t", () => {
+      expect({ namespace }).toMatchSnapshot();
+      expect({ namespace }).toMatchInlineSnapshot(${inline});
+    });
+  `;
+  const indented = "`\n" + printed.replaceAll(/^/gm, "        ") + "\n      `";
+
+  test("is undefined in a new snapshot", async () => {
+    using dir = tempDir("snapshot-unset-export-new", {
+      "stops.mjs": stops,
+      "vitest.test.js": inVitest(""),
+      // toMatchFileSnapshot() prints as Vitest does, whatever the test imports.
+      "jest.test.js": `
+        import { test, expect } from "bun:test";
+        ${load}
+        test("t", async () => {
+          expect({ namespace }).toMatchSnapshot();
+          await expect({ namespace }).toMatchFileSnapshot("./file.txt");
+        });
+      `,
+      "__snapshots__/jest.test.js.snap": headers.jest,
+    });
+    const { stderr, exitCode, pass } = await runTests(String(dir), { CI: "false" });
+    expect({ pass, stderr: pass === 2 ? "" : stderr }).toEqual({ pass: 2, stderr: "" });
+    expect({
+      inline: read(dir, "vitest.test.js"),
+      vitest: read(dir, "__snapshots__", "vitest.test.js.snap"),
+      jest: read(dir, "__snapshots__", "jest.test.js.snap"),
+      file: read(dir, "file.txt"),
+    }).toEqual({
+      inline: inVitest(indented),
+      vitest: headers.vitest + entry("t 1", printed),
+      jest: headers.jest + entry("t 1", printed),
+      file: printed,
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test("passes with what an older Bun wrote and with what Vitest writes, and fails for another value", async () => {
+    const { log, stderr, exitCode } = await logOf({
+      "stops.mjs": stops,
+      "vitest.test.js": `
+        import { test, expect } from "vitest";
+        ${firstLine}
+        ${load}
+        test("t", () => {
+          expect({ namespace }).toMatchSnapshot();
+          expect({ namespace }).toMatchInlineSnapshot(\`\n${byOlderBun}\n\`);
+          expect({ namespace }).toMatchInlineSnapshot(\`\n${printed}\n\`);
+          console.log(firstLine(() => expect({ namespace }).toMatchInlineSnapshot(\`\n${printed.replace("undefined", "1")}\n\`)));
+          console.log(firstLine(() => expect({ namespace, more: 1 }).toMatchInlineSnapshot(\`\n${byOlderBun}\n\`)));
+        });
+      `,
+      "jest.test.js": `
+        import { test, expect } from "bun:test";
+        ${load}
+        test("t", () => {
+          expect({ namespace }).toMatchSnapshot();
+        });
+      `,
+      // An older Bun added its entries at the end of the file of another runner, so the keys are not sorted.
+      "__snapshots__/vitest.test.js.snap": headers.vitest + entry("u 1", "1") + entry("t 1", byOlderBun),
+      "__snapshots__/jest.test.js.snap": headers.jest + entry("u 1", "1") + entry("t 1", byOlderBun),
+    });
+    const message = "Error: expect(received).toMatchInlineSnapshot(expected)";
+    expect({ log, stderr: exitCode ? stderr : "", exitCode }).toEqual({
+      log: [message, message],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("--update-snapshots rewrites what an older Bun wrote", async () => {
+    using dir = tempDir("snapshot-unset-export-update", {
+      "stops.mjs": stops,
+      "vitest.test.js": inVitest("`\n" + byOlderBun + "\n`"),
+      "__snapshots__/vitest.test.js.snap": headers.vitest + entry("u 1", "1") + entry("t 1", byOlderBun),
+    });
+    const { stderr, exitCode, pass } = await runTests(String(dir), { CI: "true" }, "--update-snapshots");
+    expect({ pass, stderr: pass === 1 ? "" : stderr }).toEqual({ pass: 1, stderr: "" });
+    expect({ inline: read(dir, "vitest.test.js"), file: read(dir, "__snapshots__", "vitest.test.js.snap") }).toEqual({
+      inline: inVitest("`\n" + printed + "\n`"),
+      file: headers.vitest + entry("t 1", printed),
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  // No module fails here: shared-tests.mjs runs before the body of api.mjs, which imports it. Before #44833 the title was printed too.
+  test("in a title that a module formats while the import cycle it is in loads", async () => {
+    const { stderr, exitCode } = await logOf({
+      "api.mjs": `
+        import "./shared-tests.mjs";
+        export const version = 1;
+        export function call() {}
+      `,
+      "shared-tests.mjs": `
+        import { test, expect } from "vitest";
+        import * as api from "./api.mjs";
+        test.each([[api]])("the exports of %s", namespace => {
+          expect(namespace.version).toBe(1);
+        });
+      `,
+      "a.test.js": `import "./api.mjs";`,
+    });
+    const title = stderr.match(/^\(pass\) (.*?)(?: \[[\d.]+ms\])?$/m)?.[1];
+    expect({ title, stderr: exitCode ? stderr : "", exitCode }).toEqual({
+      title: "the exports of [Object]",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // Vitest throws for this one: it transforms no node:vm module, so the namespace is a real one there too.
+  test("of a node:vm module that is linked, whatever module declares the export, and again once it has run", async () => {
+    const { log, stderr, exitCode } = await logOf({
+      "a.test.js": `
+        import { test, expect } from "vitest";
+        import vm from "node:vm";
+        test("t", async () => {
+          const declares = new vm.SourceTextModule(
+            "export const later = 1; export function hoisted() {} export class Class {} export default 5;",
+            { identifier: "declares" },
+          );
+          const exportsAgain = new vm.SourceTextModule(\`
+            export { later as renamed } from "declares";
+            export * as inner from "declares";
+            export * from "declares";
+            import { Class } from "declares";
+            export { Class as imported };
+            export let own = 1;
+          \`);
+          await exportsAgain.link(() => declares);
+          expect(exportsAgain.namespace).toMatchInlineSnapshot(\`
+            {
+              "Class": undefined,
+              "hoisted": [Function],
+              "imported": undefined,
+              "inner": {
+                "Class": undefined,
+                "default": undefined,
+                "hoisted": [Function],
+                "later": undefined,
+              },
+              "later": undefined,
+              "own": undefined,
+              "renamed": undefined,
+            }
+          \`);
+          await exportsAgain.evaluate();
+          expect(exportsAgain.namespace).toMatchInlineSnapshot(\`
+            {
+              "Class": [Function],
+              "hoisted": [Function],
+              "imported": [Function],
+              "inner": {
+                "Class": [Function],
+                "default": 5,
+                "hoisted": [Function],
+                "later": 1,
+              },
+              "later": 1,
+              "own": 1,
+              "renamed": 1,
+            }
+          \`);
+        });
+      `,
+    });
+    expect({ log, stderr: exitCode ? stderr : "", exitCode }).toEqual({ log: [], stderr: "", exitCode: 0 });
+  });
+
+  test("beside exports that a builtin makes when they are first read", async () => {
+    const { log, stderr, exitCode } = await logOf({
+      // `later` sorts first: the listing that throws has read no other export by then.
+      "exports-builtins.mjs": `
+        import * as self from "./exports-builtins.mjs";
+        export { serve } from "bun";
+        export { WriteStream as writeStream } from "node:fs";
+        (() => {
+          throw Object.assign(new Error("stops here"), { namespace: self });
+        })();
+        export const later = 1;
+      `,
+      "a.test.js": `
+        import { test, expect } from "vitest";
+        const namespace = await import("./exports-builtins.mjs").catch(error => error.namespace);
+        test("t", () => {
+          expect(namespace).toMatchInlineSnapshot(\`
+            {
+              "later": undefined,
+              "serve": [Function],
+              "writeStream": [Function],
+            }
+          \`);
+        });
+      `,
+    });
+    expect({ log, stderr: exitCode ? stderr : "", exitCode }).toEqual({ log: [], stderr: "", exitCode: 0 });
+  });
+
+  // The engine's error for such an export is a ReferenceError with this text. Code of the program can throw the same, and a
+  // read can fail for another reason. The check goes by the variable of the export, so each of these still fails the matcher.
+  test("still fails with what else a read or a listing of the namespace throws, and runs the code that throws once", async () => {
+    const { log, stderr, exitCode } = await logOf(
+      {
+        "mocked.mjs": `export const original = 1;`,
+        "mocked-name.mjs": `export const toJSON = 1;`,
+        "mocked-keys.mjs": `export const later = 1;`,
+        "exports-mocked-name.mjs": `export * from "./mocked-name.mjs";`,
+        "leaf.mjs": `export const value = 1;`,
+        // REDIS_URL is no URL of Redis, so the \`redis\` export of "bun" cannot be made. Every export of this module is set.
+        "exports-redis.mjs": `
+          export const first = { get read() { globalThis.calls++; return 1; } };
+          export { redis } from "bun";
+          export * as unread from "./leaf.mjs";
+        `,
+        "fails.mjs": `
+          export function hoisted() {}
+          throw new Error("fails.mjs does not run to its end");
+          export const later = 1;
+        `,
+        "a.test.js": `
+          import { jest } from "bun:test";
+          import { test, expect } from "vitest";
+          import * as mocked from "./mocked.mjs";
+          import * as mockedName from "./mocked-name.mjs";
+          import * as mockedKeys from "./mocked-keys.mjs";
+          import * as exportsMockedName from "./exports-mocked-name.mjs";
+          import * as exportsRedis from "./exports-redis.mjs";
+          import defer * as deferred from "./fails.mjs";
+          ${firstLine}
+          globalThis.notSet = name => new ReferenceError("Cannot access '" + name + "' before initialization.");
+          globalThis.calls = 0;
+          // jest.mock() is hoisted above the imports, so a factory can name nothing of this file.
+          // \`original\` is also a variable of the module that stands for a mock while its factory has not run.
+          jest.mock("./mocked.mjs", () => ({ get original() { globalThis.calls++; throw globalThis.notSet("original"); } }));
+          jest.mock("./mocked-name.mjs", () => ({ get toJSON() { globalThis.calls++; throw globalThis.notSet("toJSON"); } }));
+          jest.mock("./mocked-keys.mjs", () => new Proxy({ later: 1 }, {
+            ownKeys(target) { globalThis.calls++; if (globalThis.throws) throw globalThis.notSet("later"); return Reflect.ownKeys(target); },
+          }));
+          const print = value => {
+            globalThis.calls = 0;
+            return firstLine(() => expect(value).toMatchInlineSnapshot()) + ", calls: " + globalThis.calls;
+          };
+          // The title reads one export and lists none. The module object of \`import defer\` runs the module at that read.
+          console.log("import defer, in a title:", firstLine(() => test.each([{ deferred }])("$deferred.later", () => {})));
+          test("t", async () => {
+            console.log("a getter of a mock:", print(mocked));
+            console.log("a getter of a mock, under a name that the printer reads:", print(mockedName));
+            console.log("the same, through export *:", print(exportsMockedName));
+            globalThis.throws = true;
+            console.log("a mock that is a Proxy:", print(mockedKeys));
+            globalThis.calls = 0;
+            const ofBuiltin = firstLine(() => expect(exportsRedis).toMatchInlineSnapshot()).split(",")[0];
+            console.log("a builtin, and nothing is printed before:", ofBuiltin + ", calls: " + globalThis.calls);
+          });
+        `,
+      },
+      { REDIS_URL: "http://not-redis" },
+    );
+    const notSet = (name: string) => `ReferenceError: Cannot access '${name}' before initialization., calls: 1`;
+    expect({ log, stderr: exitCode ? stderr : "", exitCode }).toEqual({
+      log: [
+        "import defer, in a title: Error: fails.mjs does not run to its end",
+        "a getter of a mock: " + notSet("original"),
+        "a getter of a mock, under a name that the printer reads: " + notSet("toJSON"),
+        "the same, through export *: " + notSet("toJSON"),
+        "a mock that is a Proxy: " + notSet("later"),
+        "a builtin, and nothing is printed before: Error: Expected url protocol to be one of redis, calls: 0",
+      ],
+      stderr: "",
+      exitCode: 0,
+    });
+  });
 });
 
 // Windows cannot create directories as deep as its path buffer is long.
