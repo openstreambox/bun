@@ -89,6 +89,20 @@ enum Shape {
     Conditional,
 }
 
+/// What holds an expression that no expression is the parent of.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+enum Owner {
+    Parameter,
+    PatternProperty,
+    PatternElement,
+    Member,
+    Extends,
+    Test,
+    Update,
+    Subject,
+    Case,
+}
+
 struct CastChain {
     operand: ExprId,
     outermost: ExprId,
@@ -1749,6 +1763,71 @@ impl<'a, 's> Syntax<'a, 's> {
         initializers.chain(statements)
     }
 
+    /// Each key is a token that the source map has, and that no other owner of that kind shares.
+    fn owned_expressions(&self) -> Vec<((Owner, u32), ExprId)> {
+        let file = self.file;
+        let mut owned = Vec::new();
+        for parameter in file
+            .params
+            .iter()
+            .filter(|parameter| parameter.default.is_some())
+        {
+            if let Some(key) = self.first_identifier(parameter.pat) {
+                owned.push(((Owner::Parameter, key), parameter.default));
+            }
+        }
+        for property in file
+            .pat_props
+            .iter()
+            .filter(|property| property.default.is_some())
+        {
+            owned.push(((Owner::PatternProperty, property.key_pos), property.default));
+        }
+        for element in file
+            .pat_elems
+            .iter()
+            .filter(|element| element.default.is_some())
+        {
+            // The first identifier of a pattern in a pattern is also the key of an element inside it.
+            if let Some(pattern) = file.pats.get(element.pat.idx())
+                && matches!(pattern.kind, PatKind::Ident(_))
+            {
+                owned.push(((Owner::PatternElement, pattern.pos), element.default));
+            }
+        }
+        for class in file.classes.iter().filter(|class| class.extends.is_some()) {
+            owned.push(((Owner::Extends, self.class_body_pos(class)), class.extends));
+        }
+        for member in file
+            .members
+            .iter()
+            .filter(|member| member.kind == MemberKind::Property && member.init.is_some())
+        {
+            owned.push(((Owner::Member, self.member_key(member)), member.init));
+        }
+        for statement in file.stmts.iter() {
+            let key = statement.start;
+            match statement.kind {
+                StmtKind::If { test, .. }
+                | StmtKind::While { test, .. }
+                | StmtKind::DoWhile { test, .. } => owned.push(((Owner::Test, key), test)),
+                StmtKind::For { test, update, .. } => {
+                    owned.push(((Owner::Test, key), test));
+                    owned.push(((Owner::Update, key), update));
+                }
+                StmtKind::ForIn { expr, .. }
+                | StmtKind::ForOf { expr, .. }
+                | StmtKind::Switch { expr, .. } => owned.push(((Owner::Subject, key), expr)),
+                _ => {}
+            }
+        }
+        for case in file.cases.iter() {
+            owned.push(((Owner::Case, case.pos), case.test));
+        }
+        owned.retain(|owned| owned.1.is_some());
+        owned
+    }
+
     fn value_names(&self) -> impl Iterator<Item = u32> + '_ {
         let file = self.file;
         let variables = file
@@ -3247,8 +3326,13 @@ impl<'a> Transfer<'_, 'a, '_> {
 
     fn copy_casts(&mut self) {
         let output_anchored = self.anchored_expressions();
-        let (output, mappings, written, linked) =
-            (self.output, self.mappings, self.modules, self.linked);
+        let (output, mappings, by_original, written, linked) = (
+            self.output,
+            self.mappings,
+            self.by_original,
+            self.modules,
+            self.linked,
+        );
         let (output_file, insertions) = (output.file, &mut self.insertions);
         let output_context = output.context();
         let mut output_expressions: FxHashMap<(Shape, u32, u32), ExprId> = FxHashMap::default();
@@ -3299,6 +3383,27 @@ impl<'a> Transfer<'_, 'a, '_> {
             .filter(|property| property.kind == PropKind::Shorthand)
             .map(|property| property.value)
             .collect();
+        let output_owned = std::cell::OnceCell::new();
+        let output_owned = || {
+            output_owned.get_or_init(|| {
+                let mut owned: FxHashMap<(Owner, u32, u32), ExprId> = FxHashMap::default();
+                for ((owner, key), value) in output.owned_expressions() {
+                    if let Some((source, key)) = mappings.original(key) {
+                        owned.entry((owner, source, key)).or_insert(value);
+                    }
+                }
+                owned
+            })
+        };
+        // The places in the output of what is printed from inside an expression of a source.
+        let printed = |source: u32, expr: &Expr| {
+            let (start, end) = ((source, expr.pos), (source, expr.end));
+            let from = by_original.partition_point(|entry| (entry.0, entry.1) < start);
+            let inside = by_original[from..].iter();
+            inside
+                .take_while(move |entry| (entry.0, entry.1) < end)
+                .map(|entry| entry.2)
+        };
         for (index, module) in written.iter().enumerate() {
             let Some(module) = module.as_ref().filter(|module| !module.is_unchecked()) else {
                 continue;
@@ -3329,9 +3434,22 @@ impl<'a> Transfer<'_, 'a, '_> {
                     .flatten()
                     .find_map(|key| output_expressions.get(&(shape, index as u32, key)).copied())
             };
+            let find_below = |mut found: ExprId, way: Vec<(ExprId, usize)>| {
+                for (parent, place) in way.into_iter().rev() {
+                    let children = output.children(found);
+                    if std::mem::discriminant(&syntax.file[parent].kind)
+                        != std::mem::discriminant(&output_file[found].kind)
+                        || children.len() != syntax.children(parent).len()
+                    {
+                        return None;
+                    }
+                    found = children[place];
+                }
+                Some(found)
+            };
             let find_via_ancestor = |chain: &CastChain| {
                 let (mut at, mut way) = (chain.outermost, Vec::new());
-                let mut found = loop {
+                let found = loop {
                     if let Some(&found) = anchored
                         .get(&at)
                         .and_then(|&key| output_anchored.get(&(index as u32, key)))
@@ -3348,17 +3466,31 @@ impl<'a> Transfer<'_, 'a, '_> {
                         break found;
                     }
                 };
-                for (parent, place) in way.into_iter().rev() {
-                    let children = output.children(found);
-                    if std::mem::discriminant(&syntax.file[parent].kind)
-                        != std::mem::discriminant(&output_file[found].kind)
-                        || children.len() != syntax.children(parent).len()
-                    {
-                        return None;
+                find_below(found, way)
+            };
+            let owned = std::cell::OnceCell::new();
+            let find_via_owner = |chain: &CastChain| {
+                let owned: &FxHashMap<ExprId, (Owner, u32)> = owned.get_or_init(|| {
+                    let owned = syntax.owned_expressions().into_iter();
+                    owned.map(|(key, value)| (value, key)).collect()
+                });
+                let (mut at, mut way) = (chain.outermost, Vec::new());
+                while let Some((parent, place)) = places[at.idx()] {
+                    at = parent;
+                    if syntax.file.type_assertion_operand(parent).is_none() {
+                        way.push((parent, place));
                     }
-                    found = children[place];
                 }
-                Some(found)
+                let &(owner, key) = owned.get(&at)?;
+                let found = find_below(*output_owned().get(&(owner, index as u32, key))?, way)?;
+                // The build turns comparisons around and writes defaults of its own.
+                let (start, end) = output.outer_span(found);
+                // The printer maps a token, then may put a space before it.
+                let is_after_a_space = start > 0 && output.byte(start - 1) == b' ';
+                let start = start - u32::from(is_after_a_space);
+                printed(index as u32, &syntax.file[chain.operand])
+                    .any(|at| start <= at && at < end)
+                    .then_some(found)
             };
             let file = syntax.file;
             let variables = file
@@ -3432,14 +3564,24 @@ impl<'a> Transfer<'_, 'a, '_> {
                 }
                 let source_position = syntax.file[chain.operand].pos;
                 let found = find(chain.operand).or_else(|| find_via_ancestor(&chain));
-                let Some(operand) = found.or_else(|| {
+                let found = found.or_else(|| {
                     [Shape::Leaf, Shape::Prefix].iter().find_map(|&shape| {
                         output_expressions
                             .get(&(shape, index as u32, source_position))
                             .copied()
                             .filter(|&literal| is_literal(literal))
                     })
-                }) else {
+                });
+                // An operand that the build removed is not missed.
+                let is_missed = found.is_none()
+                    && printed(index as u32, &syntax.file[chain.operand])
+                        .next()
+                        .is_some();
+                let found = match is_missed {
+                    true => find_via_owner(&chain),
+                    false => found,
+                };
+                let Some(operand) = found else {
                     continue;
                 };
                 let member = enum_member_cast(chain.operand).filter(|_| is_literal(operand));
