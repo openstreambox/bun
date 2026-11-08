@@ -11,10 +11,10 @@ use bun_sema::bind::{
     Binding, BindingInitializer, Bound, Decl, FunctionFlags, Parent, PrivateNameId, SymbolId,
 };
 use bun_sema::check::aot::FunctionRef;
-use bun_sema::fold::Decision;
+use bun_sema::fold::{Decision, Decisions};
 use bun_sema::hir::{
     self, ClassId, ExprId, ExprKind, Flags, FnBody, FnId, FnKind, IdList, ImportEqualsId,
-    MemberKey, MemberKind, ModifierKind, NodeData, PatId, PatKind, PropKey, StmtId, StmtKind, UnOp,
+    MemberKey, MemberKind, ModifierKind, PatId, PatKind, PropKey, StmtId, StmtKind, UnOp,
     VarDeclId, VarKind,
 };
 use bun_sema::import_sites::ImportSiteKind;
@@ -28,14 +28,15 @@ use smallvec::{SmallVec, smallvec};
 
 use super::removable::{ClassChecks, Removable};
 use crate::builtins::resolve::{ModuleField, ModuleObjectOwner, ModuleObjectUse};
-use crate::builtins::table::{self, BuiltinId, MemberLookup};
+use crate::builtins::table::{self, BuiltinId};
+use crate::builtins::{BuiltinNames, Platforms};
 use crate::ir::generated::{ImportPhase, ModuleRequestKind};
 use crate::ir::{InParallel, drop_each, for_each_mut};
-use crate::known_helpers::{self, Helper, KnownHelpers, resolve_callee};
+use crate::known_helpers::KnownHelpers;
 use crate::link::{Beside, run_steps_beside};
 use crate::load::Sources;
 use crate::load::react_compiler::POSITION;
-use crate::load::sources::{ParsedSource, SourceKind, parsed_source};
+use crate::load::sources::{SourceKind, parsed_source};
 use crate::lower::LeftOutDeclarations;
 use crate::modules::{
     Candidates, ExportBinding, ExportLookup, ExportUse, ImportBinding, KnownMemberValues,
@@ -50,6 +51,7 @@ mod elements;
 #[cfg(test)]
 mod function_tests;
 mod functions;
+mod loader_hooks;
 #[cfg(test)]
 mod tests;
 
@@ -58,6 +60,8 @@ pub(crate) struct ProgramReachInput<'a, 's> {
     pub sources: &'a Sources,
     pub graph: &'a ModuleGraph,
     pub known_helpers: &'a KnownHelpers,
+    pub builtin_names: &'a BuiltinNames,
+    pub platform: Platforms,
     pub removable: RemovableOptions,
     pub counts_executions: bool,
     pub any_file_is_named_at_run_time: bool,
@@ -120,10 +124,10 @@ enum Interest {
     Lookup(Sym),
     HandedOnObject(Sym),
     Piece(u32),
-    StoreOfLoaderFunction(Option<(ExprId, LoaderHook)>),
+    StoreOfLoaderFunction(Option<ReplacedLoaderHook>),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum LoaderHook {
     ResolveFilename,
     Require,
@@ -146,10 +150,10 @@ impl LoaderHook {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReplacedLoaderHook {
     pub file: FileId,
-    pub assignment: ExprId,
+    pub store: ExprId,
     pub hook: LoaderHook,
 }
 
@@ -157,6 +161,20 @@ fn is_loader_function(builtin: BuiltinId) -> bool {
     let builtin = table::canonical_id(builtin);
     let holder = table::entry(builtin).holder.map(table::canonical_id);
     builtin == BuiltinId::NodeModulePrototypeRequire || holder == Some(BuiltinId::NodeModule)
+}
+
+fn is_folded_away(decisions: &Decisions<'_>, bound: &Bound<'_>, expression: ExprId) -> bool {
+    let mut node = expression;
+    loop {
+        match decisions.decision(node) {
+            Decision::Constant(_) | Decision::Data(_) => return true,
+            Decision::Unknown | Decision::GlobalPath(_) | Decision::DeferredData => {}
+        }
+        let Parent::Expr(parent) = bound.parent_of_expr(node) else {
+            return false;
+        };
+        node = parent;
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1857,17 +1875,7 @@ impl<'a, 's> FileScan<'a, 's> {
 
     fn is_folded_away(&self, expression: ExprId) -> bool {
         let decisions = &self.input.files.analysis(self.file).decisions;
-        let mut node = expression;
-        loop {
-            match decisions.decision(node) {
-                Decision::Constant(_) | Decision::Data(_) => return true,
-                Decision::Unknown | Decision::GlobalPath(_) | Decision::DeferredData => {}
-            }
-            let Parent::Expr(parent) = self.bound.parent_of_expr(node) else {
-                return false;
-            };
-            node = parent;
-        }
+        is_folded_away(decisions, self.bound, expression)
     }
 
     fn add_module_objects(&mut self) {
@@ -1888,121 +1896,6 @@ impl<'a, 's> FileScan<'a, 's> {
             && (self.input.graph.lists_files_in_cache() || !only_reads_entries)
         {
             self.units.interests[TOP_LEVEL as usize].push(Interest::EntryOfModuleCache);
-        }
-    }
-
-    fn skip_variables(&self, expression: ExprId, seen: &mut SmallVec<[SymbolId; 4]>) -> ExprId {
-        let (hir, bound) = (self.hir, self.bound);
-        let mut current = hir.skip_type_assertions(expression);
-        loop {
-            if !matches!(hir[current].kind, ExprKind::Ident(_))
-                || bound
-                    .dynamic_lookup_scope(NodeData::Expr(current))
-                    .is_some()
-            {
-                return current;
-            }
-            let Binding::Symbol(symbol) = bound.binding(current) else {
-                return current;
-            };
-            let BindingInitializer::Expression(initializer) =
-                bound.binding_initializer(hir, symbol)
-            else {
-                return current;
-            };
-            if seen.contains(&symbol) {
-                return current;
-            }
-            seen.push(symbol);
-            current = hir.skip_type_assertions(initializer);
-        }
-    }
-
-    fn find_value_shown_as_default(
-        &self,
-        object: ExprId,
-        seen: &mut SmallVec<[SymbolId; 4]>,
-    ) -> Option<ExprId> {
-        let hir = self.hir;
-        let ExprKind::Call(call) = hir[self.skip_variables(object, seen)].kind else {
-            return None;
-        };
-        let helpers = self.input.known_helpers;
-        let input = known_helpers::ResolveInput {
-            files: self.input.files,
-            modules: self.input.graph,
-            helpers,
-        };
-        let callee = resolve_callee(&input, self.file, hir[call].callee)?;
-        match callee.helper(helpers)? {
-            Helper::ToEsModule | Helper::ImportStar | Helper::ImportDefault => {
-                hir.ids(hir[call].args).next()
-            }
-            _ => None,
-        }
-    }
-
-    fn find_builtin_behind(
-        &self,
-        source: &ParsedSource,
-        expression: ExprId,
-        seen: &mut SmallVec<[SymbolId; 4]>,
-    ) -> Option<BuiltinId> {
-        let hir = self.hir;
-        let written = hir.skip_type_assertions(expression);
-        if let Some(builtin) = source.builtins.builtin_of_expression(written) {
-            return Some(builtin);
-        }
-        let held = self.skip_variables(written, seen);
-        if let Some(builtin) = source.builtins.builtin_of_expression(held) {
-            return Some(builtin);
-        }
-        let (object, MemberKey::Name(name)) = hir.member_key(held)? else {
-            return None;
-        };
-        if name == known::default
-            && let Some(value) = self.find_value_shown_as_default(object, seen)
-        {
-            return self.find_builtin_behind(source, value, seen);
-        }
-        let holder = table::canonical_id(self.find_builtin_behind(source, object, seen)?);
-        let name = table::find_name(self.input.files.atoms.bytes(name))?;
-        match table::member(holder, name) {
-            MemberLookup::Found(member) => Some(member),
-            MemberLookup::Unknown | MemberLookup::Absent => None,
-        }
-    }
-
-    fn add_stores_of_loader_functions(&mut self) {
-        let (files, hir) = (self.input.files, self.hir);
-        let Some(source) = parsed_source(files, self.file) else {
-            return;
-        };
-        let decisions = &files.analysis(self.file).decisions;
-        for &table in source.builtins.tables_of_loaders_written() {
-            if !decisions.is_dead_expr(table) && !self.is_folded_away(table) {
-                self.add_interest(hir[table].pos, Interest::StoreOfLoaderFunction(None));
-            }
-        }
-        let mut mentioned = source.builtins.mentioned().iter();
-        if !mentioned.any(|&builtin| table::canonical_id(builtin) == BuiltinId::NodeModule) {
-            return;
-        }
-        for expression in self.expressions() {
-            let ExprKind::Assign { target, .. } = hir[expression].kind else {
-                continue;
-            };
-            if decisions.is_dead_expr(expression) {
-                continue;
-            }
-            let stored = self.find_builtin_behind(source, target, &mut SmallVec::new());
-            if let Some(stored) = stored.filter(|&stored| is_loader_function(stored))
-                && !self.is_folded_away(expression)
-            {
-                let replaced = LoaderHook::find(stored).map(|hook| (expression, hook));
-                let interest = Interest::StoreOfLoaderFunction(replaced);
-                self.add_interest(hir[expression].pos, interest);
-            }
         }
     }
 
@@ -3431,14 +3324,7 @@ impl Reacher<'_, '_, '_> {
             Interest::StoreOfLoaderFunction(replaced) => {
                 self.keep_every_module_object(file);
                 self.found.stores_loader_function = true;
-                if let Some((assignment, hook)) = replaced {
-                    let replaced = ReplacedLoaderHook {
-                        file,
-                        assignment,
-                        hook,
-                    };
-                    self.found.replaced_loader_hooks.push(replaced);
-                }
+                self.found.replaced_loader_hooks.extend(replaced);
             }
         }
     }
@@ -3899,7 +3785,7 @@ fn fingerprint(
         }
     }
     for replaced in &reached.replaced_loader_hooks {
-        add(9, replaced.file, u64::from(replaced.assignment.0));
+        add(9, replaced.file, u64::from(replaced.store.0));
     }
     let mut sums: Vec<(&[FileId], u64)> = (files.compiled_files().chunks(FILES_OF_A_TASK))
         .map(|files| (files, 0))
@@ -4033,7 +3919,8 @@ pub(crate) fn find_left_out_code(
     reached_modules.stores_loader_function = found.stores_loader_function;
     reached_modules
         .replaced_loader_hooks
-        .sort_unstable_by_key(|replaced| (replaced.file, replaced.assignment.0));
+        .sort_unstable_by_key(|replaced| (replaced.file, replaced.store.0, replaced.hook));
+    reached_modules.replaced_loader_hooks.dedup();
     if !loads.packages.is_empty() {
         let is_data = |&&file: &&FileId| input.sources.kind(file) == SourceKind::Data;
         let data_files = input.files.compiled_files().iter().filter(is_data);

@@ -21,6 +21,7 @@ enum Extra {
     None,
     LoadsByUnknownNames,
     WaysToModuleObjects,
+    HooksStoredBehindHandOffs,
 }
 
 fn generate_program(groups: usize, extra: Extra) -> Vec<(String, String)> {
@@ -180,6 +181,16 @@ fn generate_program(groups: usize, extra: Extra) -> Vec<(String, String)> {
             )
             .unwrap();
         }
+        if extra == Extra::HooksStoredBehindHandOffs {
+            writeln!(
+                c,
+                "exports.c{group}_6 = function (Mod) {{ Mod._resolveFilename = exports.c{group}_2; }};"
+            )
+            .unwrap();
+            if is_one_in(3, 23) {
+                writeln!(c, "other.c{required}_6(require('node:module'));").unwrap();
+            }
+        }
         files.push((format!("c{group}.cjs"), c));
 
         let mut e = String::new();
@@ -234,7 +245,7 @@ impl Outcome {
             }
         }
         let hooks = reached.replaced_loader_hooks.iter();
-        let hooks = hooks.map(|it| (it.file, it.assignment.0)).collect();
+        let hooks = hooks.map(|it| (it.file, it.store.0)).collect();
         let fingerprint = fingerprint(input, &left_out, &reached, in_parallel);
         Outcome {
             left_out,
@@ -358,6 +369,8 @@ fn assert_same_on_any_number_of_threads(
             sources: bind_input.sources,
             graph: &graph,
             known_helpers: bind_input.known_helpers,
+            builtin_names: bind_input.builtin_names,
+            platform: bind_input.platform,
             removable: RemovableOptions::default(),
             counts_executions: false,
             any_file_is_named_at_run_time: false,
@@ -442,6 +455,13 @@ fn ways_to_module_objects_are_reached_alike_on_any_number_of_threads() {
     assert_same_on_any_number_of_threads(300, Extra::WaysToModuleObjects, |_, outcome| {
         assert!(!outcome.reached.naming_ways.is_empty());
         assert!(outcome.reached.with_module_objects.len() > 300);
+    });
+}
+
+#[test]
+fn hooks_stored_behind_hand_offs_are_found_alike_on_any_number_of_threads() {
+    assert_same_on_any_number_of_threads(300, Extra::HooksStoredBehindHandOffs, |_, outcome| {
+        assert!(outcome.hooks.len() > 10, "{} hooks", outcome.hooks.len());
     });
 }
 

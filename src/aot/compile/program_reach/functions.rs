@@ -1,7 +1,7 @@
 use core::mem::take;
 use core::ops::Range;
 
-use bun_sema::bind::{Binding, ClassOwner, Decl, FnOwner, Parent, PrivateNameId, SymbolId};
+use bun_sema::bind::{Binding, Bound, ClassOwner, Decl, FnOwner, Parent, PrivateNameId, SymbolId};
 use bun_sema::hir::{
     self, BinOp, ClassId, ExprId, ExprKind, Flags, FnId, MemberId, MemberKey, MemberKind, PatKind,
     PropKey, StmtId, StmtKind, UnOp, VarKind,
@@ -11,6 +11,19 @@ use smallvec::smallvec;
 
 use super::{FileScan, Interest, Part, TOP_LEVEL};
 use crate::modules::ModuleRef;
+
+pub(super) fn find_place_of_function(
+    hir: &hir::File<'_>,
+    bound: &Bound<'_>,
+    function: FnId,
+) -> Option<Range<u32>> {
+    match bound.fns[function.idx()].owner {
+        FnOwner::Expr(expression) => Some(hir[expression].pos..hir[expression].end),
+        FnOwner::Stmt(statement) => Some(hir[statement].loc.pos..hir[statement].loc.end),
+        FnOwner::Member(member) => Some(hir[member].loc.pos..hir[member].loc.end),
+        FnOwner::None | FnOwner::Type(_) => None,
+    }
+}
 
 impl FileScan<'_, '_> {
     pub(super) fn collect_function_units(&mut self, has_decorators: bool) {
@@ -45,13 +58,8 @@ impl FileScan<'_, '_> {
     }
 
     fn find_place_of_function(&self, function: FnId) -> Option<(u32, u32)> {
-        let hir = self.hir;
-        match self.bound.fns[function.idx()].owner {
-            FnOwner::Expr(expression) => Some((hir[expression].pos, hir[expression].end)),
-            FnOwner::Stmt(statement) => Some((hir[statement].loc.pos, hir[statement].loc.end)),
-            FnOwner::Member(member) => Some((hir[member].loc.pos, hir[member].loc.end)),
-            FnOwner::None | FnOwner::Type(_) => None,
-        }
+        let place = find_place_of_function(self.hir, self.bound, function)?;
+        Some((place.start, place.end))
     }
 
     fn find_places_of_several_functions(&self) -> FxHashSet<(u32, u32)> {
