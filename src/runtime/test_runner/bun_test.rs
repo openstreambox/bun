@@ -1063,9 +1063,17 @@ impl BunTest {
 
     fn handle_timeout(&mut self, global_this: &JSGlobalObject) {
         let _g = group_begin!();
-        self.execution.kill_dangling_processes_on_timeout(global_this);
-        self.execution.timer_fired_at = Timespec::now_force_real_time();
+        if !self.has_ended_entry(None) {
+            self.execution.kill_dangling_processes_on_timeout(global_this);
+        }
         self.add_result(RefDataValue::Start);
+    }
+
+    /// Whether the active entry of a sequence (of any sequence for `None`) has ended and only its step waits for a task. A step inside the drain has left such an entry, so its time limit is over.
+    pub(crate) fn has_ended_entry(&self, of_sequence: Option<usize>) -> bool {
+        self.execution.step_was_left
+            && !self.in_run_loop
+            && (0..self.result_queue.readable_length()).any(|at| self.execution.ends_active_entry(&self.result_queue.peek_item(at).data, of_sequence))
     }
 
     pub(crate) fn bun_test_timeout_callback(
@@ -1121,11 +1129,7 @@ impl BunTest {
         };
         // The report of rejected promises charges the entry that is current then, so the runner stays on this one while a promise waits for that report, and then until a task steps. A `RunTestsTask` that is already queued still steps first, because the event loop runs its queued tasks before it reports.
         if (strong.get().execution.step_was_left || has_unreported_rejections(global_this)) && strong.get().has_due_step() {
-            let execution = &mut strong.get().execution;
-            if !execution.step_was_left {
-                execution.step_was_left = true;
-                execution.step_left_at = Timespec::now_force_real_time();
-            }
+            strong.get().leave_steps(global_this);
             // The poll of this turn comes before the report. It must not sleep while this step is due.
             global_this.bun_vm().as_mut().wakeup();
             return false;
@@ -1141,11 +1145,34 @@ impl BunTest {
         true
     }
 
-    pub(crate) fn add_result(&mut self, result: RefDataValue) {
-        let _ = self.result_queue.write_item(result); // OOM/capacity: fire-and-forget
+    /// Leaves the queued steps to a task. A step inside the drain would judge time limits now and set the timer for the entries that still run, so each step keeps this time, and the timer is set here.
+    fn leave_steps(&mut self, global_this: &JSGlobalObject) {
+        self.execution.step_was_left = true;
+        let mut now = None;
+        for at in 0..self.result_queue.readable_length() {
+            let step = self.result_queue.peek_item_mut(at);
+            if step.left_at.eql(&Timespec::EPOCH) {
+                step.left_at = *now.get_or_insert_with(Timespec::now_force_real_time);
+            }
+        }
+        let earliest = self.earliest_time_limit();
+        self.update_min_timeout(global_this, &earliest);
     }
 
-    /// Whether `run_pending_step` may leave the queued step to a `RunTestsTask`: the loop in `TestCommand::run` queues one for it in every iteration. Not inside `run`, which reads the queue itself and would judge time limits by `timer_fired_at` after a decline.
+    fn earliest_time_limit(&self) -> Timespec {
+        let Some(group) = self.execution.active_group_ref() else {
+            return Timespec::EPOCH;
+        };
+        let running = group.sequences_const(&self.execution).iter().filter(|sequence| sequence.executing);
+        // SAFETY: arena-owned entry, alive for the lifetime of BunTest.
+        running.filter_map(|sequence| sequence.active_entry).fold(Timespec::EPOCH, |earliest, entry| earliest.min_ignore_epoch(unsafe { entry.as_ref() }.timespec))
+    }
+
+    pub(crate) fn add_result(&mut self, result: RefDataValue) {
+        let _ = self.result_queue.write_item(QueuedStep { data: result, left_at: Timespec::EPOCH }); // OOM/capacity: fire-and-forget
+    }
+
+    /// Whether `run_pending_step` may leave the queued step to a `RunTestsTask`: the loop in `TestCommand::run` queues one for it in every iteration. Not inside `run`, which reads the queue itself.
     pub(crate) fn has_due_step(&self) -> bool {
         self.in_wait_loop && !self.in_run_loop && self.result_queue.readable_length() > 0
     }
@@ -1185,8 +1212,8 @@ impl BunTest {
             global_this.clear_termination_exception();
             // SAFETY: `UnsafeCell`-derived `*mut`; short-lived field read between re-entrant calls.
             let step_result: StepResult = match unsafe { (*this).phase } {
-                Phase::Collection => Collection::step(this_strong, global_this, &result)?,
-                Phase::Execution => Execution::Execution::step(this_strong, global_this, &result)?,
+                Phase::Collection => Collection::step(this_strong, global_this, &result.data)?,
+                Phase::Execution => Execution::Execution::step(this_strong, global_this, &result.data, result.left_at)?,
                 Phase::Done => StepResult::Complete,
             };
             match step_result {
@@ -1942,7 +1969,13 @@ pub enum HandleUncaughtExceptionResult {
     ShowUnhandledErrorInDescribe,
 }
 
-pub(crate) type ResultQueue = LinearFifo<RefDataValue, bun_collections::linear_fifo::DynamicBuffer<RefDataValue>>;
+/// A step for `run`. `left_at` is when `run_pending_step` left it to a task, and `EPOCH` for a step that it did not leave.
+#[derive(Clone, Copy)]
+pub(crate) struct QueuedStep {
+    pub(crate) data: RefDataValue,
+    pub(crate) left_at: Timespec,
+}
+pub(crate) type ResultQueue = LinearFifo<QueuedStep, bun_collections::linear_fifo::DynamicBuffer<QueuedStep>>;
 // bun.LinearFifo(.Dynamic) → second generic is the buffer strategy.
 
 pub(crate) enum StepResult {

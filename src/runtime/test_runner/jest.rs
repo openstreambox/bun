@@ -171,8 +171,13 @@ impl<'a> TestRunner<'a> {
         if active_file.phase == bun_test::Phase::Execution {
             if let Some(group) = active_file.execution.active_group_ref() {
                 let mut latest: Option<bun_core::Timespec> = None;
-                for seq in group.sequences_const(&active_file.execution) {
+                let mut ended = false;
+                for (index, seq) in group.sequences_const(&active_file.execution).iter().enumerate() {
                     let Some(entry) = seq.active_entry else { continue };
+                    if active_file.has_ended_entry(Some(index)) {
+                        ended = true;
+                        continue;
+                    }
                     // SAFETY: arena-owned entry, alive for the lifetime of BunTest.
                     let ts = unsafe { entry.as_ref() }.timespec;
                     if latest.is_none_or(|l| ts.order(&l) == core::cmp::Ordering::Greater) {
@@ -181,6 +186,10 @@ impl<'a> TestRunner<'a> {
                 }
                 if let Some(latest) = latest {
                     return latest;
+                }
+                // The file timer can still have the time limit of an entry that has ended.
+                if ended {
+                    return bun_core::Timespec::EPOCH;
                 }
             }
         }

@@ -3460,6 +3460,9 @@ describe.concurrent("a rejection left by the callback that settles", () => {
   `;
   const leaves = `test("leaves", async () => {${leave}});`;
   const next = `test("next", () => {});`;
+  // Runs past its limit on purpose. The timer of the runner is then set for a time that has passed, so it fires in the
+  // first turn of the test that follows, before the timers of that test, and it queues a step that ends nothing.
+  const armsTheTimer = `test("arms the timer of the runner", () => Bun.sleepSync(5), 1);`;
   const failsThatTest = { results: ["(fail) leaves", "(pass) next"], errors: ["error: left"], exitCode: 1 };
 
   describe("a test fails that test", () => {
@@ -3910,6 +3913,8 @@ describe.concurrent("a rejection left by the callback that settles", () => {
       const { stdout, stderr, errors, exitCode } = await runFiles({
         "a.test.ts": `
           ${imports}
+          import { existsSync } from "node:fs";
+          import { mkdir } from "node:fs/promises";
           afterEach(() => console.log("afterEach"));
           test("leaves", async () => {
             await new Promise<void>(resolve => {
@@ -3922,10 +3927,12 @@ describe.concurrent("a rejection left by the callback that settles", () => {
                 rejected = Promise.reject(new Error("left"));
                 resolve();
               };
-              stat(import.meta.path).then(ended);
-              stat(import.meta.path).then(ended);
-              // Both calls end on the thread pool during this wait. No callback can tell before the event loop runs.
-              Bun.sleepSync(200);
+              const made = [import.meta.dir + "/one", import.meta.dir + "/two"];
+              for (const path of made) mkdir(path).then(ended);
+              // The thread pool makes both directories. It queues the end of a call right after its directory exists,
+              // and no callback can tell when: the short sleep is for that.
+              while (!made.every(path => existsSync(path))) Bun.sleepSync(1);
+              Bun.sleepSync(50);
             });
           });
           ${next}
@@ -4087,16 +4094,15 @@ describe.concurrent("a rejection left by the callback that settles", () => {
       },
     );
 
-    // The first test runs past its limit on purpose. The timer of the runner is then set for a time that has passed, so
-    // it fires in the first turn of the second test, before the timers of that test. The step that it queues waits for
-    // the task, like the end of the test, and the task comes after the slow callback. It judges the test by the time at
-    // which that timer fired. The limit of the second test is the margin for a loaded machine: the timer has to fire
-    // within 700 ms of the first sleep.
+    // The step that the timer of the runner queues is due when the next callback ends. It waits for the task, like the
+    // end of the test, and the task comes after the slow callback. The step keeps the time at which it was due, and
+    // the task judges the test by that time. The limit of the test is the margin for a loaded machine: its first timer
+    // has to end within 700 ms of the first sleep.
     test("doesn't time out a test that settled in time when a later callback of that turn is slow", async () => {
       const { stderr, errors, exitCode } = await runFiles({
         "a.test.ts": `
           ${imports}
-          test("arms the timer of the runner", () => Bun.sleepSync(5), 1);
+          ${armsTheTimer}
           test("settles in time", async () => {
             let rejected;
             await new Promise<void>(resolve => {
@@ -4117,6 +4123,399 @@ describe.concurrent("a rejection left by the callback that settles", () => {
         results: ["(fail) arms the timer of the runner", "(pass) settles in time"],
         errors: [],
         exitCode: 1,
+      });
+    });
+
+    // Here the step of the timer is due when the slow callback ends, and the test is past its limit then. A step
+    // inside the drain fails the test at that point, so the task does too.
+    test("times out a test that was past its limit when the step of the runner's timer was due", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          ${armsTheTimer}
+          test("settles late", async () => {
+            let rejected;
+            await new Promise<void>(resolve => {
+              setTimeout(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                // Past the time limit of this test.
+                Bun.sleepSync(60);
+              }, 5);
+              setTimeout(() => {
+                rejected.catch(() => {});
+                resolve();
+              }, 10);
+              // Both timers are due before the event loop runs again.
+              Bun.sleepSync(20);
+            });
+          }, 50);
+        `,
+      });
+      expect({ results: results(stderr), errors, exitCode }).toEqual({
+        results: ["(fail) arms the timer of the runner", "(fail) settles late"],
+        errors: [],
+        exitCode: 1,
+      });
+      expect(stderr).toContain("timed out after 50ms");
+    });
+
+    // The timer fires while the step of "leaves" waits. The step that it queues is due when "settles in time" ends,
+    // so the task judges by that time, with the same margin as above.
+    test("doesn't time out a test that settled in time after the runner's timer fired while a step waited", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          ${armsTheTimer}
+          let rejected;
+          test.concurrent("leaves", async () => {
+            await new Promise<void>(resolve => {
+              // An immediate runs before the timers of its turn.
+              setImmediate(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              });
+            });
+          });
+          test.concurrent("settles in time", async () => {
+            await new Promise<void>(resolve => {
+              setTimeout(resolve, 5);
+              setTimeout(() => {
+                rejected.catch(() => {});
+                // Past the time limit of this test.
+                Bun.sleepSync(720);
+              }, 10);
+              // Both timers are due before the event loop runs again.
+              Bun.sleepSync(20);
+            });
+          }, 720);
+        `,
+      });
+      expect({ results: results(stderr), errors, exitCode }).toEqual({
+        results: ["(fail) arms the timer of the runner", "(pass) leaves", "(pass) settles in time"],
+        errors: [],
+        exitCode: 1,
+      });
+    });
+
+    // The step of the timer was due before "overruns" started, so its time says nothing about that test. The task
+    // judges it by the clock.
+    test("times out a test that overran after the task took a step of the runner's timer", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          ${armsTheTimer}
+          test("leaves", async () => {
+            await new Promise<void>(resolve => {
+              setImmediate(() => {
+                Promise.reject(new Error("left"));
+                resolve();
+              });
+              // The step of the runner's timer is due when this callback ends.
+              setTimeout(() => {}, 5);
+              // The timer is due before the event loop runs again.
+              Bun.sleepSync(10);
+            });
+          });
+          test("overruns", async () => {
+            // Past the time limit of this test before it returns its promise.
+            Bun.sleepSync(60);
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }, 20);
+        `,
+      });
+      expect({ results: results(stderr), errors, exitCode }).toEqual({
+        results: ["(fail) arms the timer of the runner", "(fail) leaves", "(fail) overruns"],
+        errors: ["error: left"],
+        exitCode: 1,
+      });
+      expect(stderr).toContain("timed out after 20ms");
+    });
+
+    // The report of the turn charges the hook and queues a step for it. No drain comes between that step and the
+    // task, so the task judges it by the clock, and the hook is past its limit then.
+    test("times out a hook that ran past its limit when the report of the turn queues its step", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          beforeEach(async () => {
+            await new Promise<void>(resolve => {
+              setTimeout(() => void Promise.reject(new Error("left")), 5);
+              setTimeout(() => {
+                // Past the time limit of this hook.
+                Bun.sleepSync(50);
+                // It settles in the immediates of the next turn, before the timers of that turn.
+                setImmediate(resolve);
+              }, 10);
+              // Both timers are due before the event loop runs again.
+              Bun.sleepSync(20);
+            });
+          }, 30);
+          test("has a slow hook", () => {});
+        `,
+      });
+      expect({ results: results(stderr), errors, exitCode }).toEqual({
+        results: ["(fail) has a slow hook"],
+        errors: ["error: left"],
+        exitCode: 1,
+      });
+      expect(stderr).toContain("a beforeEach/afterEach hook timed out for this test");
+    });
+
+    // The end of the last test of a group starts the wait for the matchers of that group. That wait is judged at the
+    // time at which the end was due too, with the same margin as above.
+    test("doesn't time out a matcher of a concurrent group whose last test ended in time", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          let rejected;
+          test.concurrent("leaves", async () => {
+            await new Promise<void>(resolve => {
+              setTimeout(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              }, 5);
+            });
+          }, 720);
+          test.concurrent("floats a matcher", async () => {
+            let release;
+            const pending = new Promise(resolve => void (release = resolve));
+            setTimeout(() => {
+              rejected.catch(() => {});
+              // Past the time limits of the group.
+              Bun.sleepSync(720);
+              // The matcher settles in the immediates of the next turn, before the timers of that turn.
+              setImmediate(() => release(1));
+            }, 10);
+            // Both timers are due before the event loop runs again.
+            Bun.sleepSync(20);
+            await Promise.resolve();
+            // Not awaited. The group waits for it after its tests have ended.
+            expect(pending).resolves.toBe(1);
+          }, 720);
+        `,
+      });
+      expect({ results: results(stderr)?.sort(), errors, exitCode }).toEqual({
+        results: ["(pass) floats a matcher", "(pass) leaves"],
+        errors: [],
+        exitCode: 0,
+      });
+    });
+
+    // A step inside the drain sets the runner's timer for the test that runs. The runner sets it when it leaves the
+    // step too, so the time limit fires in the event loop that runs under the second timer.
+    test("times out a test whose limit passes in an event loop under a callback while a step waits", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          ${armsTheTimer}
+          test("overruns", async () => {
+            let rejected;
+            await new Promise<void>(resolve => {
+              setTimeout(() => void (rejected = Promise.reject(new Error("handled late"))), 5);
+              setTimeout(() => {
+                rejected.catch(() => {});
+                try {
+                  // The event loop runs under this call until the plugin has set up, past the time limit of this test.
+                  Bun.build({
+                    entrypoints: ["./nope.ts"],
+                    plugins: [{ name: "waits", setup: () => new Promise((_, reject) => setTimeout(reject, 250)) }],
+                  });
+                } catch {}
+                resolve();
+              }, 10);
+              // Both timers are due before the event loop runs again.
+              Bun.sleepSync(20);
+            });
+          }, 200);
+        `,
+      });
+      expect({ results: results(stderr), errors, exitCode }).toEqual({
+        results: ["(fail) arms the timer of the runner", "(fail) overruns"],
+        errors: [],
+        exitCode: 1,
+      });
+      expect(stderr).toContain("timed out after 200ms");
+    });
+
+    // The test settled, so the fire of its time limit ends nothing, and the process that it spawned is for its hook.
+    test("doesn't kill the processes of a test whose end waits when its time limit fires", async () => {
+      const { stdout, stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          let child;
+          afterEach(async () => {
+            child.kill("SIGKILL");
+            await child.exited;
+            console.log("child ended by " + child.signalCode);
+          });
+          test("settles in time", async () => {
+            child = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 60000)"], stdio: ["ignore", "ignore", "ignore"] });
+            let rejected;
+            await new Promise<void>(resolve => {
+              setImmediate(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              });
+              setImmediate(() => {
+                rejected.catch(() => {});
+                // Past the time limit of this test.
+                Bun.sleepSync(60);
+              });
+            });
+          }, 40);
+        `,
+      });
+      expect({ killed: /killed \d+ dangling/.test(stderr), results: results(stderr), errors, exitCode }).toEqual({
+        killed: false,
+        results: ["(pass) settles in time"],
+        errors: [],
+        exitCode: 0,
+      });
+      // The runner ends a process with another signal.
+      if (!isWindows) expect(stdout).toContain("child ended by SIGKILL");
+    });
+
+    // The end of its callback does not end a test that an un-awaited matcher keeps open. That test still runs into its
+    // time limit, so the runner ends what it spawned.
+    test("kills the processes of a test that times out while a matcher keeps it open", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          let child;
+          afterAll(() => void child.kill("SIGKILL"));
+          test("times out", async () => {
+            child = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 60000)"], stdio: ["ignore", "ignore", "ignore"] });
+            // Not awaited, and its promise never settles.
+            expect(new Promise(() => {})).resolves.toBe(1);
+            let rejected;
+            await new Promise<void>(resolve => {
+              setImmediate(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              });
+              setImmediate(() => {
+                rejected.catch(() => {});
+                // Past the time limit of this test.
+                Bun.sleepSync(60);
+              });
+            });
+          }, 40);
+        `,
+      });
+      expect({ killed: /killed \d+ dangling/.test(stderr), results: results(stderr), errors, exitCode }).toEqual({
+        killed: true,
+        results: ["(fail) times out"],
+        errors: [],
+        exitCode: 1,
+      });
+      expect(stderr).toContain("timed out after 40ms");
+    });
+
+    // The task that took the step of "leaves" started this test, so nothing of it waits for a task. The runner's timer
+    // fires in an event loop that runs under its callback.
+    test("kills the processes of a test that the task started and that runs past its limit", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          ${tickUnderJS}
+          let child;
+          afterAll(() => void child.kill("SIGKILL"));
+          test("leaves", async () => {
+            let rejected;
+            await new Promise<void>(resolve => {
+              setImmediate(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              });
+              setImmediate(() => void rejected.catch(() => {}));
+            });
+          });
+          test("runs past its limit", done => {
+            child = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 60000)"], stdio: ["ignore", "ignore", "ignore"] });
+            done(new Error("fails"));
+            // Past the time limit of this test.
+            Bun.sleepSync(60);
+            tickUnderJS();
+          }, 40);
+        `,
+      });
+      expect({ killed: /killed \d+ dangling/.test(stderr), results: results(stderr), errors, exitCode }).toEqual({
+        killed: true,
+        results: ["(pass) leaves", "(fail) runs past its limit"],
+        errors: ["error: fails"],
+        exitCode: 1,
+      });
+    });
+
+    // The step that waits is the end of the first attempt, which ends nothing anymore. The second attempt still runs
+    // into its time limit.
+    test("kills the processes of a test that runs past its limit while a step that doesn't end it waits", async () => {
+      const { stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          let attempt = 0;
+          let settleFirst;
+          let child;
+          afterAll(() => void child.kill("SIGKILL"));
+          test("overruns", async () => {
+            if (++attempt === 1) {
+              // The first attempt times out.
+              return new Promise<void>(resolve => void (settleFirst = resolve));
+            }
+            child = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 60000)"], stdio: ["ignore", "ignore", "ignore"] });
+            await new Promise<void>(() => {
+              setImmediate(() => {
+                Promise.reject(new Error("left"));
+                settleFirst();
+                // Past the time limit of this attempt.
+                Bun.sleepSync(60);
+              });
+            });
+          }, { retry: 1, timeout: 40 });
+        `,
+      });
+      expect({ killed: /killed \d+ dangling/.test(stderr), results: results(stderr), errors, exitCode }).toEqual({
+        killed: true,
+        results: ["(fail) overruns (attempt 2)"],
+        errors: ["error: left"],
+        exitCode: 1,
+      });
+    });
+
+    // The sync call asks the runner for the time limit of the test that runs. A test whose end waits has none anymore.
+    test("lets Bun.spawnSync() in a later callback run past the limit of a test whose end waits", async () => {
+      const { stdout, stderr, errors, exitCode } = await runFiles({
+        "a.test.ts": `
+          ${imports}
+          test("settles in time", async () => {
+            let rejected;
+            await new Promise<void>(resolve => {
+              setImmediate(() => {
+                rejected = Promise.reject(new Error("handled late"));
+                resolve();
+              });
+              setImmediate(() => {
+                rejected.catch(() => {});
+                // Past the time limit of this test.
+                const child = Bun.spawnSync({ cmd: [process.execPath, "-e", "Bun.sleepSync(100)"], stdio: ["ignore", "ignore", "ignore"] });
+                console.log("sync child: exit code " + child.exitCode);
+              });
+            });
+          }, 40);
+        `,
+      });
+      expect({
+        stdout: stdout.match(/^sync child: .*$/m)?.[0],
+        killed: /killed \d+ dangling/.test(stderr),
+        results: results(stderr),
+        errors,
+        exitCode,
+      }).toEqual({
+        stdout: "sync child: exit code 0",
+        killed: false,
+        results: ["(pass) settles in time"],
+        errors: [],
+        exitCode: 0,
       });
     });
 
@@ -4220,7 +4619,8 @@ describe.concurrent("a rejection left by the callback that settles", () => {
     });
 
     // The other direction: the timer of the runner fires for a test that has not settled, after the step of another
-    // test of the group was left. That fire is what the task judges by.
+    // test of the group was left. No callback of that turn comes after the fire, so its step is not due before the
+    // task, and the task judges by its own clock.
     test("times out a concurrent test that ran past its limit while a step waited", async () => {
       const { stderr, errors, exitCode } = await runFiles({
         "a.test.ts": `
@@ -4536,9 +4936,8 @@ describe.concurrent("a rejection left by the callback that settles", () => {
   describe("of a test that still runs isn't reported when a later callback of the same turn handles it", () => {
     const passes = { errors: [], exitCode: 0 };
 
-    // Callbacks of one turn run with no report in between. The runner's own timer is one of them here. The first test
-    // runs past its limit on purpose, so that timer is set for a time that has passed. It fires in the first turn of
-    // the second test, before the timers of that test, and it queues a step of the runner.
+    // Callbacks of one turn run with no report in between. The runner's own timer is one of them here, and it queues a
+    // step of the runner.
     test.each(
       Object.entries({
         // An immediate runs before the timers of its turn.
@@ -4550,7 +4949,7 @@ describe.concurrent("a rejection left by the callback that settles", () => {
       const { stderr, errors, exitCode } = await runFiles({
         "a.test.ts": `
           ${imports}
-          test("arms the timer of the runner", () => Bun.sleepSync(5), 1);
+          ${armsTheTimer}
           test("handles it late", async () => {
             let rejected;
             const handled = new Promise<void>(resolve => {

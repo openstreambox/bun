@@ -97,12 +97,8 @@ pub(crate) struct Execution {
     /// The entry whose callback is on the stack, which `get_current_state_data()` can't name in a concurrent group.
     /// Cleared before the call's microtasks drain, because those can resume other tests in the group.
     pub(crate) on_stack: core::cell::Cell<Option<EntryData>>,
-    /// When the time limit timer of the file last fired.
-    pub(crate) timer_fired_at: Timespec,
-    /// `run_pending_step` declined a step, and declines until a task has called `run`. That `run` judges an entry that already ran at `step_left_at` by `timer_fired_at`, not by its own clock.
+    /// `run_pending_step` declined a step, and declines until a task has called `run`. It is still set while that `run` takes the steps.
     pub(crate) step_was_left: bool,
-    /// When `step_was_left` was set.
-    pub(crate) step_left_at: Timespec,
 }
 
 pub(crate) struct ConcurrentGroup {
@@ -219,8 +215,12 @@ impl ExecutionSequence {
 
     /// Call once the active entry's callback is done. An entry that already errored doesn't wait.
     fn waits_for_matchers(&mut self) -> bool {
-        self.callback_done = self.pending_matchers > 0 && !self.maybe_skip;
+        self.callback_done = self.has_pending_matchers();
         self.callback_done
+    }
+
+    fn has_pending_matchers(&self) -> bool {
+        self.pending_matchers > 0 && !self.maybe_skip
     }
 
     fn entry_mode(&self) -> ScopeMode {
@@ -431,9 +431,7 @@ impl Execution {
             sequences: Box::default(),
             group_index: 0,
             on_stack: core::cell::Cell::new(None),
-            timer_fired_at: Timespec::EPOCH,
             step_was_left: false,
-            step_left_at: Timespec::EPOCH,
         }
     }
 
@@ -483,12 +481,14 @@ impl Execution {
         buntest_strong: &BunTestPtr,
         global_this: &JSGlobalObject,
         data: &RefDataValue,
+        left_at: Timespec,
     ) -> JsResult<StepResult> {
         let _g = group_begin!();
         let buntest = buntest_strong.get();
         let buntest_ptr = NonNull::from(&mut *buntest);
         let this = &mut buntest.execution;
-        let mut now = Timespec::now_force_real_time();
+        // A step that `run_pending_step` left to a task judges time limits at the time at which it was due, like a step inside the drain.
+        let mut now = if left_at.eql(&Timespec::EPOCH) { Timespec::now_force_real_time() } else { left_at };
 
         match data {
             RefDataValue::Start => {
@@ -587,6 +587,20 @@ impl Execution {
         &mut self,
         data: &RefDataValue,
     ) -> Option<(&mut ExecutionSequence, &mut ConcurrentGroup)> {
+        let seq_abs = self.current_and_valid_sequence_index(data)?;
+        // Disjoint split-borrow of `self.groups` and `self.sequences`.
+        Some((&mut self.sequences[seq_abs], &mut self.groups[self.group_index]))
+    }
+
+    /// Whether `data` ends the entry that a sequence of the active group runs now. The end of an entry that waits for matchers does not.
+    pub(crate) fn ends_active_entry(&self, data: &RefDataValue, of_sequence: Option<usize>) -> bool {
+        let Some(seq_abs) = self.current_and_valid_sequence_index(data) else { return false };
+        let first = self.groups[self.group_index].sequence_start;
+        of_sequence.is_none_or(|index| first + index == seq_abs) && !self.sequences[seq_abs].has_pending_matchers()
+    }
+
+    /// The place in `sequences` of the sequence whose active entry `data` names, if `data` is current.
+    fn current_and_valid_sequence_index(&self, data: &RefDataValue) -> Option<usize> {
         let _g = group_begin!();
 
         group_log::log(format_args!("runOneCompleted: data: {}", data));
@@ -612,14 +626,13 @@ impl Execution {
             group_log::log(format_args!("runOneCompleted: the data did not know the group"));
             return None;
         }
-        // Disjoint split-borrow of `self.groups` and `self.sequences`.
-        let group = &mut self.groups[*group_index];
+        let group = &self.groups[*group_index];
         let seq_abs = group.sequence_start + entry_data.sequence_index;
         if seq_abs >= group.sequence_end {
             group_log::log(format_args!("runOneCompleted: the data did not know the sequence"));
             return None;
         }
-        let sequence = &mut self.sequences[seq_abs];
+        let sequence = &self.sequences[seq_abs];
         if sequence.attempt != entry_data.attempt {
             group_log::log(format_args!(
                 "runOneCompleted: the data is for a previous retry or repeat (outdated)",
@@ -637,7 +650,7 @@ impl Execution {
             return None;
         }
         group_log::log(format_args!("runOneCompleted: the data is valid and current"));
-        Some((sequence, group))
+        Some(seq_abs)
     }
 
     /// `group_ptr` is a `NonNull` because the callers carry it across `run_test_callback`, which re-enters.
@@ -1196,9 +1209,9 @@ fn step_sequence_one(
         };
         // SAFETY: arena-owned entry
         let active_entry = unsafe { &mut *active_entry_ptr.as_ptr() };
-        // `timespec` is the start of the entry plus its timeout.
-        let ran_when_step_was_left = this.step_was_left && active_entry.timespec.order(&this.step_left_at.add_ms(i64::from(active_entry.timeout))).is_lt();
-        let judged_at = if ran_when_step_was_left { this.timer_fired_at } else { *now };
+        // The clock of a step that was left is in the past, so an entry that the task has started since then is judged by the clock of now. `timespec` is the start of the entry plus its timeout.
+        let started_since = this.step_was_left && active_entry.timespec.order(&now.add_ms(i64::from(active_entry.timeout))).is_gt();
+        let judged_at = if started_since { Timespec::now_force_real_time() } else { *now };
         if active_entry.evaluate_timeout(sequence, &judged_at) {
             if let Some(context) = sequence.context.as_ref().map(Strong::get) {
                 TestContext::abort_signal(context, global_this);
