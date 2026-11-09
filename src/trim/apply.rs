@@ -781,6 +781,7 @@ mod tests {
             refused_entry_points: Vec::new(),
             icu_packages: Vec::new(),
             keeps_table: false,
+            locales_left_out: None,
         }
     }
 

@@ -46,6 +46,7 @@ diagnostic_codes! {
         WorkerTextNotCompiled = 100084, Warning, "This Worker may start from code in a text: a data: or blob: URL, or the text of a Worker with eval: true. That code isn't compiled, so it runs in the interpreter. To compile it, move it to a file and write the path as new URL(\"./file\", import.meta.url)";
         FolderNamedAsParentIsSpelled = 100085, Error, "Two files would have the path \"{0}\" in the executable: \"{1}\" and \"{2}\". A folder above that of the entry point is written \"_.._\" there, so no folder beside it can have that name";
         WorkerFilesGoByOnePath = 100086, Warning, "In the executable \"{0}\" is all that is left of the paths of two files: \"{1}\" and \"{2}\". A \"..\" above the root of the executable takes nothing away, so nothing tells the two apart, and a Worker that starts from either fails to load. Pass both files to the build as entry points";
+        LocaleDataLeftOut = 100099, Warning, "compile.trim.locales leaves out the data of \"{0}\". A call that needs it exits the process with code 70 if it runs. Add \"{0}\" to the list";
         FilesLeftOutByPattern = 100089, Warning, "The executable doesn't embed {0}, which this path may name. {1}";
         DataFilesFoundByPattern = 100088, Note, "This path isn't a constant, so the executable embeds every file that it may name. These aren't code: {0}";
 

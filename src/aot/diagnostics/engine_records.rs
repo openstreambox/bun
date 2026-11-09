@@ -1,4 +1,6 @@
+use bun_ast::Log;
 use bun_sema::check::aot::{Effect, FileOrigin, effect_of};
+use bun_trim::TrimPlan;
 
 use super::int32_flows::write_int32_message;
 use super::sink::{append_location, to_driver_diagnostic, to_log_message};
@@ -8,7 +10,7 @@ use crate::engine::{
     EngineResult, InternalErrorRecord, Position, UserDiagnosticRecord, position_of,
 };
 use crate::ir::ModuleId;
-use crate::ir::generated::{DiagnosticSeverity, UserDiagnosticKind, Witness};
+use crate::ir::generated::{DiagnosticSeverity, LocaleUseKind, UserDiagnosticKind, Witness};
 use crate::report::{ModuleLocator, ModuleOrigin, SourceTexts};
 
 fn is_about_load_by_unknown_name(record: &UserDiagnosticRecord) -> bool {
@@ -18,6 +20,24 @@ fn is_about_load_by_unknown_name(record: &UserDiagnosticRecord) -> bool {
             | UserDiagnosticKind::ModuleNamedAtRunTimeIsRefused
             | UserDiagnosticKind::LoaderIsHeldByUnseenCode
     )
+}
+
+/// `plans`: one for each executable that the build writes. They are made of what the engine found, so this runs behind the build.
+pub fn log_locales_left_out(
+    engine: &EngineResult,
+    texts: &SourceTexts,
+    plans: &[&TrimPlan],
+    log: &mut Log,
+) {
+    let mut diagnostics = Diagnostics::new();
+    for record in engine.locales_used() {
+        let tag = engine.text(record.tag);
+        let is_left_out = || plans.iter().any(|plan| plan.leaves_out_locale(tag));
+        if record.kind == LocaleUseKind::Constant && is_left_out() {
+            diagnostics.add_at_witness(Code::LocaleDataLeftOut, &[tag], &record.witness, texts);
+        }
+    }
+    diagnostics.write_to(log);
 }
 
 impl Diagnostics {
